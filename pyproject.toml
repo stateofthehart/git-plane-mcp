@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-git-plane"
+version = "0.1.0"
+description = "Git + Plane MCP server: schema-enforced commits with automatic issue tracking"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "fastmcp>=2.0,<3.0",
+    "httpx>=0.24.0",
+]
+
+[project.scripts]
+mcp-git-plane = "mcp_git_plane.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_git_plane"]
