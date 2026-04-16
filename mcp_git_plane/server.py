@@ -1,17 +1,27 @@
 """Git + Plane MCP Server.
 
 Schema-enforced commits with automatic Plane issue tracking.
-This is the ONLY way agents should interact with git when working on tracked issues.
+This server provides git operations ONLY. For project management (creating
+issues, managing sprints, labels, etc.), use the Plane MCP directly.
 
 Tools:
-    commit      - Validate message, commit, sync to Plane (atomic)
-    push        - Push to remote
-    status      - Git status + staged changes summary
-    log         - Git log with optional issue filtering
-    claim_issue - Transition issue to In Progress + comment
-    close_issue - Transition issue to Done with summary + commit links
-    create_issue - Create a new Plane work item
-    get_my_work  - List Todo/In Progress items for a project
+    commit  - Validate message schema, stage files, git commit, sync to Plane
+    push    - Push to remote
+    status  - Git status summary
+    log     - Git log with optional issue filtering
+
+Why these tools exist:
+    - commit: The core value — enforces commit message schema at the tool
+      boundary and atomically syncs git commits to Plane issues. Neither
+      raw git nor the Plane MCP can do this alone.
+    - push/status/log: Standard git operations that agents need. No Plane
+      overlap. Provided here so agents have one MCP for all code workflow.
+
+What this server does NOT do (use Plane MCP instead):
+    - Create/update/delete issues (use create_work_item)
+    - Manage projects, cycles, modules, labels, states
+    - Search work items, read comments, check activities
+    - Any project management that isn't tied to a git commit
 """
 
 from __future__ import annotations
@@ -23,13 +33,16 @@ from fastmcp import FastMCP
 
 from .git_ops import (
     add,
+    checkout as git_checkout,
     commit as git_commit,
     construct_commit_url,
+    create_branch as git_create_branch,
     current_branch,
+    diff as git_diff,
     diff_staged,
-    get_repo_root,
     has_staged_changes,
     log as git_log,
+    pull as git_pull,
     push as git_push,
     rev_parse_head,
     status as git_status,
@@ -101,17 +114,17 @@ def _execute_plane_action(
         if in_progress_id:
             plane.update_work_item(project_id, work_item_id, state=in_progress_id)
             results.append("State -> In Progress")
-        comment = f"<p>Work started. Commit: <code>{commit_sha[:8] if commit_sha else 'N/A'}</code></p>"
-        if commit_message:
-            comment = f"<p>Work started: {commit_message}</p>"
+        comment = f"<p>Work started: {commit_message or 'N/A'}</p>"
+        if commit_sha:
+            comment += f"<p>Commit: <code>{commit_sha[:8]}</code></p>"
         plane.add_comment(project_id, work_item_id, comment)
         results.append("Commented")
 
     elif action == "update":
         # Comment only, no state change
-        comment = f"<p>Progress: <code>{commit_sha[:8] if commit_sha else 'N/A'}</code>"
-        if commit_message:
-            comment = f"<p>{commit_message}</p>"
+        comment = f"<p>Progress: {commit_message or 'N/A'}</p>"
+        if commit_sha:
+            comment += f"<p>Commit: <code>{commit_sha[:8]}</code></p>"
         plane.add_comment(project_id, work_item_id, comment)
         results.append("Commented")
 
@@ -158,7 +171,7 @@ def _execute_plane_action(
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# MCP Tools — git operations only
 # ---------------------------------------------------------------------------
 
 
@@ -187,13 +200,19 @@ def commit(
             'ref'      - link commit to issue only
             'none'     - no Plane interaction (default)
         issue: Issue reference like 'QFP-15'. Required unless action is 'none'.
-        files: Specific files to stage. If None, only commits already-staged files.
+        files: Specific files to stage before committing. If None, only
+            commits already-staged files (unless stage_all is True).
         stage_all: If True, stages all changes (git add -A) before committing.
 
     Returns:
-        Success message with commit SHA and Plane actions taken, or error message.
+        Success message with commit SHA and Plane actions taken, or
+        REJECTED/FAILED with explanation.
     """
     cwd = _resolve_cwd()
+
+    # Validate action requires issue
+    if action != "none" and not issue:
+        return "REJECTED: action requires an issue reference (e.g., issue='QFP-15')"
 
     # Build the full commit message
     if action != "none" and issue:
@@ -207,7 +226,7 @@ def commit(
         return f"REJECTED: {'; '.join(parsed.errors)}"
 
     # 2. Validate issue exists in Plane (if referenced)
-    resolved_issues: list[tuple[str, str, dict, str, int]] = []
+    resolved_issues = []
     for ia in parsed.issue_actions:
         resolved = _resolve_issue(ia.project_prefix, ia.sequence_id)
         if not resolved:
@@ -217,8 +236,7 @@ def commit(
                 f"#{ia.sequence_id} is valid."
             )
         project_id, work_item_id, state_map = resolved
-        resolved_issues.append((project_id, work_item_id, state_map,
-                                ia.action, ia.sequence_id))
+        resolved_issues.append((project_id, work_item_id, state_map, ia))
 
     # 3. Stage files if requested
     if files:
@@ -250,10 +268,10 @@ def commit(
 
     # 7. Execute Plane actions
     plane_results = []
-    for project_id, work_item_id, state_map, act, seq_id in resolved_issues:
+    for project_id, work_item_id, state_map, ia in resolved_issues:
         try:
             pr = _execute_plane_action(
-                action=act,
+                action=ia.action,
                 project_id=project_id,
                 work_item_id=work_item_id,
                 state_map=state_map,
@@ -261,9 +279,9 @@ def commit(
                 commit_url=commit_url,
                 commit_message=parsed.description,
             )
-            plane_results.append(f"  {parsed.issue_actions[0].issue_ref}: {pr}")
+            plane_results.append(f"  {ia.issue_ref}: {pr}")
         except Exception as e:
-            plane_results.append(f"  Plane sync failed (non-fatal): {e}")
+            plane_results.append(f"  {ia.issue_ref}: Plane sync failed (non-fatal): {e}")
 
     # 8. Build response
     lines = [f"Committed: {commit_sha[:8]} {parsed.description}"]
@@ -338,175 +356,65 @@ def log(n: int = 10, issue: str | None = None) -> str:
 
 
 @mcp.tool
-def claim_issue(issue: str, plan: str | None = None) -> str:
-    """Claim a Plane issue by transitioning it to In Progress.
+def diff(staged: bool = False, file_path: str | None = None) -> str:
+    """Show diff of changes in the working tree.
 
     Args:
-        issue: Issue reference like 'QFP-15'
-        plan: Optional brief plan of how you'll approach this work
+        staged: If True, show only staged changes. If False, show unstaged changes.
+        file_path: Optional specific file to diff.
+
+    Returns:
+        Diff output or 'No changes' message.
+    """
+    cwd = _resolve_cwd()
+    result = git_diff(cwd, staged=staged, file_path=file_path)
+    if result.success:
+        return result.stdout or "No changes."
+    return f"FAILED: {result.stderr}"
+
+
+@mcp.tool
+def pull(remote: str = "origin") -> str:
+    """Pull latest changes from remote. Run this before pushing to avoid conflicts.
+
+    Args:
+        remote: Remote name (default: 'origin')
 
     Returns:
         Success or error message.
     """
-    import re
-    match = re.match(r"([A-Z]+)-(\d+)", issue)
-    if not match:
-        return f"REJECTED: Invalid issue format '{issue}'. Expected: PROJ-123"
-
-    prefix, seq = match.group(1), int(match.group(2))
-    resolved = _resolve_issue(prefix, seq)
-    if not resolved:
-        return f"REJECTED: Issue {issue} not found in Plane."
-
-    project_id, work_item_id, state_map = resolved
-    plane = _get_plane()
-
-    # Transition to In Progress
-    in_progress_id = state_map.get("In Progress")
-    if in_progress_id:
-        plane.update_work_item(project_id, work_item_id, state=in_progress_id)
-
-    # Comment
-    comment = f"<p>Claiming this issue. "
-    if plan:
-        comment += f"Plan: {plan}"
-    comment += "</p>"
-    plane.add_comment(project_id, work_item_id, comment)
-
-    return f"Claimed {issue} -> In Progress"
+    cwd = _resolve_cwd()
+    result = git_pull(cwd, remote)
+    if result.success:
+        return result.stdout or "Already up to date."
+    return f"FAILED: {result.stderr}"
 
 
 @mcp.tool
-def close_issue(issue: str, summary: str) -> str:
-    """Close a Plane issue by transitioning it to Done with a summary.
+def branch(name: str | None = None) -> str:
+    """Show current branch, or create and switch to a new branch.
 
-    Call this AFTER committing and pushing. The commit should already
-    reference this issue via the commit tool.
-
-    Args:
-        issue: Issue reference like 'QFP-15'
-        summary: Summary of what was done (displayed in Plane comment)
-
-    Returns:
-        Success or error message.
-    """
-    import re
-    match = re.match(r"([A-Z]+)-(\d+)", issue)
-    if not match:
-        return f"REJECTED: Invalid issue format '{issue}'. Expected: PROJ-123"
-
-    prefix, seq = match.group(1), int(match.group(2))
-    resolved = _resolve_issue(prefix, seq)
-    if not resolved:
-        return f"REJECTED: Issue {issue} not found in Plane."
-
-    project_id, work_item_id, state_map = resolved
-    plane = _get_plane()
-
-    # Comment with summary
-    comment = f"<p>Completed: {summary}</p>"
-    plane.add_comment(project_id, work_item_id, comment)
-
-    # Transition to Done
-    done_id = state_map.get("Done")
-    if done_id:
-        plane.update_work_item(project_id, work_item_id, state=done_id)
-
-    return f"Closed {issue} -> Done"
-
-
-@mcp.tool
-def create_issue(
-    project: str,
-    name: str,
-    priority: str = "medium",
-    description: str | None = None,
-) -> str:
-    """Create a new Plane work item in a project.
+    Only create branches when the human explicitly requests one.
+    Default workflow is direct push to the current branch.
 
     Args:
-        project: Project identifier like 'QFP', 'QFM', 'EXE', etc.
-        name: Work item title (concise, imperative)
-        priority: One of 'urgent', 'high', 'medium', 'low', 'none'
-        description: Optional description (plain text, will be wrapped in HTML)
+        name: If provided, create and switch to this branch.
+              If None, show the current branch name.
 
     Returns:
-        The created issue reference (e.g., 'QFP-16') or error message.
+        Current branch name, or confirmation of new branch creation.
     """
-    plane = _get_plane()
-    proj = plane.get_project_by_identifier(project)
-    if not proj:
-        return f"REJECTED: Project '{project}' not found in Plane."
-
-    project_id = proj["id"]
-
-    # Get the Todo state as default
-    state_map = plane.get_state_map(project_id)
-    todo_id = state_map.get("Todo")
-
-    fields: dict = {"priority": priority}
-    if todo_id:
-        fields["state"] = todo_id
-    if description:
-        fields["description_html"] = f"<p>{description}</p>"
-
-    item = plane.create_work_item(project_id, name, **fields)
-    seq = item.get("sequence_id", "?")
-    identifier = proj.get("identifier", project)
-
-    return f"Created {identifier}-{seq}: {name}"
-
-
-@mcp.tool
-def get_my_work(project: str, include_backlog: bool = False) -> str:
-    """List open work items (Todo + In Progress) for a project.
-
-    Args:
-        project: Project identifier like 'QFP', 'QFM', 'EXE', etc.
-        include_backlog: Also show Backlog items (default: False)
-
-    Returns:
-        Formatted list of open work items with priority and state.
-    """
-    plane = _get_plane()
-    proj = plane.get_project_by_identifier(project)
-    if not proj:
-        return f"REJECTED: Project '{project}' not found in Plane."
-
-    project_id = proj["id"]
-    identifier = proj.get("identifier", project)
-    states = plane.list_states(project_id)
-    state_id_to_name = {s["id"]: s["name"] for s in states}
-
-    target_groups = {"unstarted", "started"}
-    if include_backlog:
-        target_groups.add("backlog")
-    target_state_ids = {
-        s["id"] for s in states if s.get("group") in target_groups
-    }
-
-    items = plane.list_work_items(project_id, per_page=100)
-    filtered = [i for i in items if i.get("state") in target_state_ids]
-
-    if not filtered:
-        return f"No open work items in {identifier}."
-
-    # Sort by priority (urgent first) then by created_at
-    priority_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
-    filtered.sort(key=lambda i: (
-        priority_order.get(i.get("priority", "none"), 5),
-        i.get("created_at", ""),
-    ))
-
-    lines = [f"Open work in {identifier} ({len(filtered)} items):"]
-    for item in filtered:
-        ref = f"{identifier}-{item['sequence_id']}"
-        state = state_id_to_name.get(item.get("state", ""), "?")
-        priority = item.get("priority", "none")
-        name = item.get("name", "Untitled")
-        lines.append(f"  [{priority:>6}] {ref} ({state}): {name}")
-
-    return "\n".join(lines)
+    cwd = _resolve_cwd()
+    if name:
+        result = git_create_branch(cwd, name)
+        if result.success:
+            return f"Created and switched to branch: {name}"
+        return f"FAILED: {result.stderr}"
+    else:
+        result = current_branch(cwd)
+        if result.success:
+            return f"Current branch: {result.stdout}"
+        return f"FAILED: {result.stderr}"
 
 
 # ---------------------------------------------------------------------------

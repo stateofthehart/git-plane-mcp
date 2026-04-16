@@ -125,6 +125,36 @@ def get_repo_root(cwd: str) -> str | None:
     return result.stdout if result.success else None
 
 
+def diff(cwd: str, staged: bool = False, file_path: str | None = None) -> GitResult:
+    """Show diff of changes."""
+    args = ["diff"]
+    if staged:
+        args.append("--cached")
+    if file_path:
+        args.extend(["--", file_path])
+    return _run(args, cwd)
+
+
+def pull(cwd: str, remote: str = "origin", branch: str | None = None) -> GitResult:
+    """Pull from remote."""
+    args = ["pull", remote]
+    if branch:
+        args.append(branch)
+    return _run(args, cwd, timeout=60)
+
+
+def create_branch(cwd: str, name: str, checkout: bool = True) -> GitResult:
+    """Create a new branch, optionally checking it out."""
+    if checkout:
+        return _run(["checkout", "-b", name], cwd)
+    return _run(["branch", name], cwd)
+
+
+def checkout(cwd: str, ref: str) -> GitResult:
+    """Checkout a branch or ref."""
+    return _run(["checkout", ref], cwd)
+
+
 def construct_commit_url(cwd: str, sha: str) -> str | None:
     """Construct a GitHub/GitLab commit URL from remote + SHA."""
     result = remote_url(cwd)
