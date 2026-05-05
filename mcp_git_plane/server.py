@@ -68,8 +68,19 @@ def _get_plane() -> PlaneClient:
     return _plane
 
 
-def _resolve_cwd() -> str:
-    """Get the working directory — from env or current directory."""
+def _resolve_cwd(override: str | None = None) -> str:
+    """Resolve the working directory for git operations.
+
+    Precedence (highest to lowest):
+    1. ``override`` — the per-call ``repo_path`` argument from a tool. Used
+       when the server runs as an HTTP daemon serving multiple repos: the
+       caller (or an upstream gateway-proxy injecting defaults via scope
+       rules) names which repo each call targets.
+    2. ``GIT_WORK_DIR`` env var — single-repo daemon mode (rare).
+    3. ``os.getcwd()`` — stdio per-session mode (the original behavior).
+    """
+    if override:
+        return override
     return os.environ.get("GIT_WORK_DIR", os.getcwd())
 
 
@@ -182,6 +193,7 @@ def commit(
     issue: str | None = None,
     files: list[str] | None = None,
     stage_all: bool = False,
+    repo_path: str | None = None,
 ) -> str:
     """Validate commit message, stage files, commit, and sync to Plane.
 
@@ -203,12 +215,17 @@ def commit(
         files: Specific files to stage before committing. If None, only
             commits already-staged files (unless stage_all is True).
         stage_all: If True, stages all changes (git add -A) before committing.
+        repo_path: Absolute path to the repo this commit targets. When the
+            server runs as a shared HTTP daemon, callers (or the upstream
+            gateway-proxy injecting defaults) must name the repo here.
+            When unset, falls back to GIT_WORK_DIR / os.getcwd() for the
+            stdio per-session case.
 
     Returns:
         Success message with commit SHA and Plane actions taken, or
         REJECTED/FAILED with explanation.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
 
     # Validate action requires issue
     if action != "none" and not issue:
@@ -293,17 +310,22 @@ def commit(
 
 
 @mcp.tool
-def push(remote: str = "origin", branch: str | None = None) -> str:
+def push(
+    remote: str = "origin",
+    branch: str | None = None,
+    repo_path: str | None = None,
+) -> str:
     """Push commits to remote.
 
     Args:
         remote: Remote name (default: 'origin')
         branch: Branch to push (default: current branch)
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Success or error message.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
     result = git_push(cwd, remote, branch)
     if result.success:
         br = current_branch(cwd)
@@ -312,13 +334,16 @@ def push(remote: str = "origin", branch: str | None = None) -> str:
 
 
 @mcp.tool
-def status() -> str:
+def status(repo_path: str | None = None) -> str:
     """Show git status: staged changes, unstaged changes, untracked files.
+
+    Args:
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Formatted status summary.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
 
     stat = git_status(cwd)
     if not stat.success:
@@ -338,17 +363,22 @@ def status() -> str:
 
 
 @mcp.tool
-def log(n: int = 10, issue: str | None = None) -> str:
+def log(
+    n: int = 10,
+    issue: str | None = None,
+    repo_path: str | None = None,
+) -> str:
     """Show recent git log, optionally filtered by issue reference.
 
     Args:
         n: Number of commits to show (default: 10)
         issue: Filter to commits referencing this issue (e.g., 'QFP-15')
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Git log output.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
     result = git_log(cwd, n=n, grep=issue)
     if result.success:
         return result.stdout or "No commits found."
@@ -356,17 +386,22 @@ def log(n: int = 10, issue: str | None = None) -> str:
 
 
 @mcp.tool
-def diff(staged: bool = False, file_path: str | None = None) -> str:
+def diff(
+    staged: bool = False,
+    file_path: str | None = None,
+    repo_path: str | None = None,
+) -> str:
     """Show diff of changes in the working tree.
 
     Args:
         staged: If True, show only staged changes. If False, show unstaged changes.
         file_path: Optional specific file to diff.
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Diff output or 'No changes' message.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
     result = git_diff(cwd, staged=staged, file_path=file_path)
     if result.success:
         return result.stdout or "No changes."
@@ -374,16 +409,17 @@ def diff(staged: bool = False, file_path: str | None = None) -> str:
 
 
 @mcp.tool
-def pull(remote: str = "origin") -> str:
+def pull(remote: str = "origin", repo_path: str | None = None) -> str:
     """Pull latest changes from remote. Run this before pushing to avoid conflicts.
 
     Args:
         remote: Remote name (default: 'origin')
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Success or error message.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
     result = git_pull(cwd, remote)
     if result.success:
         return result.stdout or "Already up to date."
@@ -391,7 +427,7 @@ def pull(remote: str = "origin") -> str:
 
 
 @mcp.tool
-def branch(name: str | None = None) -> str:
+def branch(name: str | None = None, repo_path: str | None = None) -> str:
     """Show current branch, or create and switch to a new branch.
 
     Only create branches when the human explicitly requests one.
@@ -400,11 +436,12 @@ def branch(name: str | None = None) -> str:
     Args:
         name: If provided, create and switch to this branch.
               If None, show the current branch name.
+        repo_path: Absolute path to the repo (HTTP-daemon mode). See ``commit``.
 
     Returns:
         Current branch name, or confirmation of new branch creation.
     """
-    cwd = _resolve_cwd()
+    cwd = _resolve_cwd(repo_path)
     if name:
         result = git_create_branch(cwd, name)
         if result.success:
